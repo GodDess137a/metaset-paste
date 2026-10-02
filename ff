@@ -1,0 +1,627 @@
+-- GodDess Solver v3
+-- Sources: pose parameter, LBY, jitter history, anim layer, freestanding,
+--          per-state hit memory, per-enemy pattern (alternating) detection.
+-- Each source's weight and polarity are learned from real hits/misses.
+-- Detailed per-shot console log + CSV (goddess_log.csv) + stats button.
+
+local ffi = require("ffi")
+local bit = require("bit")
+
+-- ====================== FFI ======================
+pcall(ffi.cdef, [[
+    struct gd_animation_layer_t {
+        char pad20[24];
+        uint32_t m_nSequence;
+        float m_flPrevCycle;
+        float m_flWeight;
+        float m_flWeightDeltaRate;
+        float m_flPlaybackRate;
+        float m_flCycle;
+        uintptr_t m_pOwner;
+        char pad_0038[4];
+    };
+
+    struct gd_animstate {
+        char pad[3];
+        char m_bForceWeaponUpdate;
+        char pad1[91];
+        void* m_pBaseEntity;
+        void* m_pActiveWeapon;
+        void* m_pLastActiveWeapon;
+        float m_flLastClientSideAnimationUpdateTime;
+        int m_iLastClientSideAnimationUpdateFramecount;
+        float m_flAnimUpdateDelta;
+        float m_flEyeYaw;
+        float m_flPitch;
+        float m_flGoalFeetYaw;
+        float m_flCurrentFeetYaw;
+        float m_flCurrentTorsoYaw;
+        float m_flUnknownVelocityLean;
+        float m_flLeanAmount;
+        char pad2[4];
+        float m_flFeetCycle;
+        float m_flFeetYawRate;
+        char pad3[4];
+        float m_fDuckAmount;
+        float m_fLandingDuckAdditiveSomething;
+        char pad4[4];
+        float m_vOriginX, m_vOriginY, m_vOriginZ;
+        float m_vLastOriginX, m_vLastOriginY, m_vLastOriginZ;
+        float m_vVelocityX, m_vVelocityY;
+        char pad5[4];
+        float m_flUnknownFloat1;
+        char pad6[8];
+        float m_flUnknownFloat2, m_flUnknownFloat3, m_flUnknown;
+        float m_flSpeed2D, m_flUpVelocity, m_flSpeedNormalized;
+        float m_flFeetSpeedForwardsOrSideWays;
+        float m_flFeetSpeedUnknownForwardOrSideways;
+        float m_flTimeSinceStartedMoving, m_flTimeSinceStoppedMoving;
+        bool m_bOnGround, m_bInHitGroundAnimation;
+        char m_pad[2];
+        float m_flJumpToFall, m_flTimeSinceInAir, m_flLastOriginZ;
+        float m_flHeadHeightOrOffsetFromHittingGroundAnimation;
+        float m_flStopToFullRunningFraction;
+        char pad7[4];
+        float m_flMagicFraction;
+    };
+]])
+
+local classptr = ffi.typeof("void***")
+local rawientitylist = client.create_interface("client.dll", "VClientEntityList003") or error("VClientEntityList003 not found")
+local ientitylist = ffi.cast(classptr, rawientitylist)
+local get_client_entity = ffi.cast("void*(__thiscall*)(void*, int)", ientitylist[0][3])
+
+-- NOTE: offsets can change between game builds
+local OFF_ANIMOVERLAY = 0x2990
+local OFF_ANIMSTATE   = 0x9960
+
+local function get_anim_layer(ent, layer)
+    local ptr = get_client_entity(ientitylist, ent)
+    if ptr == nil then return nil end
+    local arr = ffi.cast("struct gd_animation_layer_t**", ffi.cast("char*", ptr) + OFF_ANIMOVERLAY)[0]
+    if arr == nil then return nil end
+    return arr[layer or 6]
+end
+
+local function get_animstate(ent)
+    local ptr = get_client_entity(ientitylist, ent)
+    if ptr == nil then return nil end
+    local as = ffi.cast("struct gd_animstate**", ffi.cast("char*", ptr) + OFF_ANIMSTATE)[0]
+    if as == nil then return nil end
+    return as
+end
+
+-- ====================== Helpers ======================
+local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function sign(x) return x > 0 and 1 or (x < 0 and -1 or 0) end
+
+local function normalize_yaw(y)
+    y = math.fmod(y, 360)
+    if y > 180 then y = y - 360 elseif y < -180 then y = y + 360 end
+    return y
+end
+local function angle_diff(a, b) return normalize_yaw(a - b) end
+
+local function get_max_desync(ent)
+    local as = get_animstate(ent)
+    if not as then return 58 end
+    local speedfactor = clamp(as.m_flFeetSpeedForwardsOrSideWays, 0, 1)
+    local avg = (as.m_flStopToFullRunningFraction * -0.3 - 0.2) * speedfactor + 1
+    if as.m_fDuckAmount > 0 then
+        avg = avg + (as.m_fDuckAmount * speedfactor * (0.5 - avg))
+    end
+    return clamp(avg, 0.5, 1) * 58
+end
+
+local function get_state(ent, speed)
+    local fl = entity.get_prop(ent, "m_fFlags") or 1
+    if bit.band(fl, 1) == 0 then return "air" end
+    if speed > 5 then return "move" end
+    return "stand"
+end
+
+-- ====================== UI ======================
+local enable    = ui.new_checkbox("RAGE", "Other", "GodDess Resolver")
+local cb_pose   = ui.new_checkbox("RAGE", "Other", "  Pose parameter analysis")
+local cb_lby    = ui.new_checkbox("RAGE", "Other", "  LBY analysis")
+local cb_jitter = ui.new_checkbox("RAGE", "Other", "  Jitter analysis")
+local cb_layer  = ui.new_checkbox("RAGE", "Other", "  Anim layer analysis")
+local cb_fs     = ui.new_checkbox("RAGE", "Other", "  Freestanding analysis")
+local cb_pat    = ui.new_checkbox("RAGE", "Other", "  Enemy pattern memory")
+local cb_pitch  = ui.new_checkbox("RAGE", "Other", "  Defensive pitch fix")
+local cb_invert = ui.new_checkbox("RAGE", "Other", "  Invert side (manual)")
+local cb_debug  = ui.new_checkbox("RAGE", "Other", "  Detailed log (console)")
+local cb_csv    = ui.new_checkbox("RAGE", "Other", "  Save CSV log (goddess_log.csv)")
+for _, c in ipairs({ cb_pose, cb_lby, cb_jitter, cb_layer, cb_fs, cb_pat, cb_pitch, cb_debug }) do
+    ui.set(c, true)
+end
+
+-- ====================== Learning model ======================
+-- base weight, prior accuracy, whether polarity may be auto-flipped
+local SRC = {
+    pose   = { base = 3.0, prior = 0.70, flip = true  },
+    lby    = { base = 3.0, prior = 0.70, flip = true  },
+    jitter = { base = 1.5, prior = 0.60, flip = true  },
+    layer  = { base = 1.0, prior = 0.50, flip = true  },
+    fs     = { base = 1.0, prior = 0.55, flip = true  },
+    mem    = { base = 3.0, prior = 0.70, flip = false },
+    pat    = { base = 2.5, prior = 0.65, flip = false },
+}
+local PRIOR_STRENGTH = 4
+local STATS = {}                 -- key "src:state" -> {a=raw agreements, n=samples}
+local TOTAL = { hit = 0, rmiss = 0, omiss = 0 }
+
+local function get_stat(src, state)
+    local k = src .. ":" .. state
+    local s = STATS[k]
+    if not s then s = { a = 0, n = 0 }; STATS[k] = s end
+    return s
+end
+
+-- returns polarity (+1/-1), weight, accuracy(effective)
+local function eval_src(src, state)
+    local cfg = SRC[src]
+    local s = get_stat(src, state)
+    local acc = (s.a + cfg.prior * PRIOR_STRENGTH) / (s.n + PRIOR_STRENGTH)
+    local pol = 1
+    if cfg.flip and s.n >= 8 and acc < 0.30 then
+        pol = -1
+        acc = 1 - acc
+    end
+    local skill = clamp((acc - 0.5) * 2, 0, 1)
+    return pol, cfg.base * (0.15 + 1.85 * skill), acc
+end
+
+local function learn(shot, truth, wgt)
+    for _, v in ipairs(shot.votes) do
+        local s = get_stat(v.src, shot.state)
+        s.n = s.n + wgt
+        if v.raw == truth then s.a = s.a + wgt end
+    end
+end
+
+-- brute order after resolver misses: {side multiplier, fraction of max desync}
+local BRUTE = {
+    { -1, 1.00 }, { 1, 0.50 }, { -1, 0.50 }, { 1, 0.75 },
+    { -1, 0.75 }, { 1, 0.30 }, { -1, 0.30 }, { 1, 1.00 },
+}
+
+-- ====================== Per-enemy data ======================
+local data = {}
+
+local function get_data(ent)
+    local d = data[ent]
+    if not d then
+        d = {
+            hist = {}, last_sim = 0,
+            side = 1, amt = 58, body_yaw = 0, has = false, max = 58,
+            misses = 0, votes = {}, brute = false, state = "stand", src = "-",
+            shots = {}, mem = {}, confirmed = {},
+            stable_pitch = 0, prev_pitch = nil, flick = 0, force_pitch = false,
+            dbg = {},
+        }
+        data[ent] = d
+    end
+    return d
+end
+
+-- ====================== Logging ======================
+local csv_lines = {
+    "time;target;event;shot_id;state;speed;duck;eye_yaw;lby;lby_delta;pose_delta;jit_avg;jit;max_desync;votes;side;amt;stage;brute;hc;hitgroup;dmg;result",
+}
+
+local function flush_csv()
+    if ui.get(cb_csv) and type(writefile) == "function" then
+        pcall(writefile, "goddess_log.csv", table.concat(csv_lines, "\n"))
+    end
+end
+
+local function votes_str(votes)
+    local t = {}
+    for _, v in ipairs(votes) do
+        t[#t + 1] = string.format("%s:%+d>%+d(w%.2f)", v.src, v.raw, v.side, v.w)
+    end
+    return #t > 0 and table.concat(t, " ") or "none"
+end
+
+local function dlog(r, g, b, msg)
+    if ui.get(cb_debug) then client.color_log(r, g, b, "[GodDess] " .. msg) end
+end
+
+local function csv_add(ent, event, id, shot, result)
+    if not ui.get(cb_csv) then return end
+    local dbg = shot.dbg or {}
+    csv_lines[#csv_lines + 1] = table.concat({
+        string.format("%.2f", globals.realtime()),
+        entity.get_player_name(ent) or tostring(ent),
+        event, tostring(id), shot.state,
+        string.format("%.1f", dbg.speed or 0),
+        string.format("%.2f", dbg.duck or 0),
+        string.format("%.1f", dbg.yaw or 0),
+        string.format("%.1f", dbg.lby or 0),
+        string.format("%.1f", dbg.lby_delta or 0),
+        string.format("%.1f", dbg.pose_delta or 0),
+        string.format("%.1f", dbg.jit_avg or 0),
+        tostring(dbg.jitter or false),
+        string.format("%.1f", shot.max or 0),
+        (votes_str(shot.votes):gsub(" ", "|")),
+        string.format("%+d", shot.side),
+        string.format("%.0f", shot.amt),
+        tostring(shot.stage), tostring(shot.brute),
+        tostring(shot.hc or ""), tostring(shot.hg or ""), tostring(shot.dmg or ""),
+        result,
+    }, ";")
+    flush_csv()
+end
+
+-- ====================== Analysis ======================
+local function analyze_jitter(h)
+    if #h < 5 then return false, 0 end
+    local n = math.min(8, #h - 1)
+    local total, flips, prev = 0, 0, 0
+    for i = 1, n do
+        local df = angle_diff(h[i].yaw, h[i + 1].yaw)
+        total = total + math.abs(df)
+        local s = sign(df)
+        if s ~= 0 and prev ~= 0 and s ~= prev then flips = flips + 1 end
+        if s ~= 0 then prev = s end
+    end
+    local avg = total / n
+    return (avg > 20 and flips >= math.floor(n / 2) - 1), avg
+end
+
+local function digit(val, i)
+    return math.floor(math.abs(val) * 10 ^ i + 1e-6) % 10
+end
+
+local function layer_vote(ent)
+    local layer = get_anim_layer(ent, 6)
+    if not layer then return 0, nil end
+    local wt = layer.m_flWeight
+    if wt < 0.001 then return 0, nil end
+
+    local pb, w = {}, {}
+    for i = 1, 9 do pb[i] = digit(layer.m_flPlaybackRate, i) end
+    for i = 1, 6 do w[i] = digit(wt, i) end
+
+    local amt
+    if pb[3] == 0 then
+        amt = -3.4117 * (pb[6] + pb[7] + pb[8] + pb[9]) + 98.9393
+    else
+        amt = -3.4117 * (pb[4] + pb[5] + pb[6] + pb[7]) + 98.9393
+    end
+    amt = clamp(math.abs(amt), 0, 60)
+
+    local side = 0
+    if w[1] == 9 then
+        local t = w[4] * 10 + w[5]
+        if t == 29 then side = -1 elseif t == 30 then side = 1 end
+    end
+    return side, amt
+end
+
+local function freestand_side(ent)
+    local me = entity.get_local_player()
+    if not me or not entity.is_alive(me) then return 0 end
+    local lx, ly, lz = client.eye_position()
+    local hx, hy, hz = entity.hitbox_position(ent, 0)
+    if not lx or not hx then return 0 end
+
+    local base = math.atan2(ly - hy, lx - hx)
+    local blocked = { [-1] = 0, [1] = 0 }
+    for _, dist in ipairs({ 20, 32, 44 }) do
+        for _, s in ipairs({ -1, 1 }) do
+            local a = base + s * math.pi / 2
+            local px = hx + math.cos(a) * dist
+            local py = hy + math.sin(a) * dist
+            local frac = client.trace_line(me, lx, ly, lz, px, py, hz)
+            blocked[s] = blocked[s] + (1 - frac)
+        end
+    end
+    local diff = blocked[1] - blocked[-1]
+    if math.abs(diff) < 0.25 then return 0 end
+    return diff > 0 and 1 or -1
+end
+
+-- alternating confirmed sides (+,-,+ ...) -> predict the opposite of the last one
+local function predict_alt(d)
+    local c = d.confirmed
+    local n = #c
+    if n < 3 then return 0 end
+    if c[n].side ~= c[n - 1].side and c[n - 1].side ~= c[n - 2].side then
+        return -c[n].side
+    end
+    return 0
+end
+
+-- ====================== Core ======================
+local function update(ent, d)
+    local pitch, yaw = entity.get_prop(ent, "m_angEyeAngles")
+    local sim = entity.get_prop(ent, "m_flSimulationTime")
+    if not yaw or not sim then return end
+    if sim <= d.last_sim then return end -- same tick / old data / tickbase shift
+    d.last_sim = sim
+
+    local vx, vy = entity.get_prop(ent, "m_vecVelocity")
+    local speed = vx and math.sqrt(vx * vx + vy * vy) or 0
+    local lby = entity.get_prop(ent, "m_flLowerBodyYawTarget") or yaw
+    local duck = entity.get_prop(ent, "m_flDuckAmount") or 0
+    local pose = entity.get_prop(ent, "m_flPoseParameter", 11)
+    local pose_delta = pose and (pose - 0.5) * 120 or nil
+    local state = get_state(ent, speed)
+
+    table.insert(d.hist, 1, { yaw = yaw, pitch = pitch, sim = sim, lby = lby, speed = speed })
+    if #d.hist > 16 then table.remove(d.hist) end
+
+    local max_desync = get_max_desync(ent)
+    local h = d.hist
+    local jitter, jitter_avg = false, 0
+    if ui.get(cb_jitter) then jitter, jitter_avg = analyze_jitter(h) end
+
+    -- ---------- votes ----------
+    local votes = {}
+    local function add(src, raw, mult)
+        if raw == 0 then return end
+        local pol, w = eval_src(src, state)
+        votes[#votes + 1] = { src = src, raw = raw, side = raw * pol, w = w * (mult or 1) }
+    end
+
+    local lby_delta = angle_diff(lby, yaw)
+    local amt_pose, amt_lby, amt_layer
+
+    -- Pose parameter: networked body-yaw pose = real feet-eye delta
+    if ui.get(cb_pose) and pose_delta and math.abs(pose_delta) >= 8 then
+        add("pose", sign(pose_delta))
+        amt_pose = clamp(math.abs(pose_delta), 8, max_desync)
+    end
+
+    -- LBY: when standing, lby differs from eye yaw by the real body yaw
+    if ui.get(cb_lby) and state == "stand" and not jitter then
+        local a = math.abs(lby_delta)
+        if a >= 8 and a <= 75 then -- >75 = lby breaker update tick, ignore
+            add("lby", sign(lby_delta))
+            amt_lby = clamp(a, 8, max_desync)
+        end
+    end
+
+    -- Jitter: after eye yaw jumps, the body lags behind the new eye yaw
+    if jitter and #h >= 2 then
+        add("jitter", -sign(angle_diff(h[1].yaw, h[2].yaw)))
+    end
+
+    -- Anim layer 6
+    if ui.get(cb_layer) then
+        local s, a = layer_vote(ent)
+        add("layer", s)
+        amt_layer = a
+    end
+
+    -- Freestanding
+    if ui.get(cb_fs) then add("fs", freestand_side(ent)) end
+
+    -- Enemy pattern memory
+    local mem
+    if ui.get(cb_pat) then
+        local alt = predict_alt(d)
+        if alt ~= 0 then
+            add("pat", alt)               -- alternating enemy: ignore plain memory
+        else
+            mem = d.mem[state]
+            if mem then add("mem", mem.side) end
+        end
+    end
+
+    local score, total = 0, 0
+    for _, v in ipairs(votes) do
+        score = score + v.side * v.w
+        total = total + v.w
+    end
+    local side = score > 0 and 1 or (score < 0 and -1 or d.side)
+
+    -- ---------- amount ----------
+    local function agrees(src)
+        for _, v in ipairs(votes) do
+            if v.src == src then return v.side == side end
+        end
+        return false
+    end
+
+    local amt
+    if mem and agrees("mem") then amt = mem.amt
+    elseif amt_pose and agrees("pose") then amt = amt_pose
+    elseif amt_lby and agrees("lby") then amt = amt_lby
+    elseif jitter then amt = max_desync * 0.92
+    elseif amt_layer and agrees("layer") then amt = amt_layer * 0.4 + max_desync * 0.6
+    else amt = max_desync end
+
+    -- ---------- brute after misses ----------
+    d.brute = false
+    if d.misses > 0 then
+        local st = BRUTE[((d.misses - 1) % #BRUTE) + 1]
+        side = side * st[1]
+        amt = max_desync * st[2]
+        d.brute = true
+    end
+
+    amt = clamp(amt, 0, 60)
+    d.side, d.amt, d.votes, d.state, d.max = side, amt, votes, state, max_desync
+    d.body_yaw = amt * side
+    d.has = true
+    d.dbg = {
+        speed = speed, duck = duck, yaw = yaw, lby = lby, lby_delta = lby_delta,
+        pose_delta = pose_delta, jit_avg = jitter_avg, jitter = jitter,
+    }
+
+    local best, bw = "-", 0
+    for _, v in ipairs(votes) do
+        if v.w > bw then best, bw = v.src, v.w end
+    end
+    d.src = d.brute and "brute" or best
+
+    -- ---------- defensive pitch ----------
+    d.force_pitch = false
+    if ui.get(cb_pitch) and pitch then
+        if d.prev_pitch and math.abs(pitch - d.prev_pitch) < 30 and math.abs(pitch) <= 89.5 then
+            d.stable_pitch = pitch
+            d.flick = 0
+        elseif math.abs(pitch - d.stable_pitch) > 60 then
+            d.flick = d.flick + 1
+            if d.flick <= 2 then
+                d.force_pitch = true       -- short flick = defensive, ignore it
+            else
+                d.stable_pitch = clamp(pitch, -89, 89)
+                d.flick = 0
+            end
+        end
+        d.prev_pitch = pitch
+    end
+end
+
+local function apply(ent, d)
+    if not d.has then return end
+    local by = d.body_yaw
+    if ui.get(cb_invert) then by = -by end
+    plist.set(ent, "Correction active", true)
+    plist.set(ent, "Force body yaw", true)
+    plist.set(ent, "Force body yaw value", math.floor(clamp(by, -60, 60) + 0.5))
+    if d.force_pitch then
+        plist.set(ent, "Force pitch", true)
+        plist.set(ent, "Force pitch value", math.floor(clamp(d.stable_pitch, -89, 89)))
+    else
+        plist.set(ent, "Force pitch", false)
+    end
+end
+
+local function reset_plist()
+    for _, ent in ipairs(entity.get_players(true)) do
+        plist.set(ent, "Force body yaw", false)
+        plist.set(ent, "Force pitch", false)
+    end
+end
+
+-- ====================== Shot events ======================
+client.set_event_callback("aim_fire", function(e)
+    local d = data[e.target]
+    if not d or not d.has then return end
+    local shot = {
+        side = d.side, amt = d.amt, votes = d.votes, brute = d.brute, stage = d.misses,
+        state = d.state, max = d.max, dbg = d.dbg, src = d.src,
+        hc = e.hitchance and math.floor(e.hitchance) or nil, hg = e.hitgroup, dmg = e.damage,
+    }
+    d.shots[e.id] = shot
+    d.shots[e.id - 30] = nil
+
+    dlog(120, 200, 255, string.format(
+        "FIRE #%d %s | %s spd=%.0f duck=%.2f | lbyΔ=%.1f poseΔ=%s jit=%s(%.0f) max=%.0f | %s | => side %+d amt %.0f stage %d%s",
+        e.id, entity.get_player_name(e.target) or "?", d.state, d.dbg.speed, d.dbg.duck,
+        d.dbg.lby_delta, d.dbg.pose_delta and string.format("%.1f", d.dbg.pose_delta) or "n/a",
+        tostring(d.dbg.jitter), d.dbg.jit_avg, d.max, votes_str(d.votes),
+        d.side, d.amt, d.misses, d.brute and " BRUTE" or ""))
+    csv_add(e.target, "fire", e.id, shot, "")
+end)
+
+client.set_event_callback("aim_hit", function(e)
+    local d = get_data(e.target)
+    local shot = d.shots[e.id]
+    TOTAL.hit = TOTAL.hit + 1
+    if shot then
+        learn(shot, shot.side, 1)
+        d.mem[shot.state] = { side = shot.side, amt = shot.amt }
+        table.insert(d.confirmed, { side = shot.side, state = shot.state })
+        if #d.confirmed > 6 then table.remove(d.confirmed, 1) end
+        dlog(80, 255, 120, string.format("HIT  #%d | src=%s side %+d amt %.0f | state=%s stage=%d",
+            e.id, shot.src, shot.side, shot.amt, shot.state, shot.stage))
+        csv_add(e.target, "result", e.id, shot, "hit")
+    end
+    d.misses = 0
+end)
+
+client.set_event_callback("aim_miss", function(e)
+    local d = get_data(e.target)
+    local shot = d.shots[e.id]
+    if e.reason ~= "?" then
+        TOTAL.omiss = TOTAL.omiss + 1
+        if shot then
+            dlog(255, 200, 80, string.format("MISS #%d (not resolver) reason=%s", e.id, tostring(e.reason)))
+            csv_add(e.target, "result", e.id, shot, "miss_" .. tostring(e.reason))
+        end
+        return
+    end
+
+    TOTAL.rmiss = TOTAL.rmiss + 1
+    if shot then
+        -- weak evidence: with a big amount and no brute, true side was probably opposite
+        if not shot.brute and shot.amt >= 0.7 * shot.max then
+            learn(shot, -shot.side, 0.5)
+        end
+        d.mem[shot.state] = nil
+        dlog(255, 90, 90, string.format("MISS #%d RESOLVER | src=%s side %+d amt %.0f | state=%s stage=%d | %s",
+            e.id, shot.src, shot.side, shot.amt, shot.state, shot.stage, votes_str(shot.votes)))
+        csv_add(e.target, "result", e.id, shot, "miss_resolver")
+    end
+    d.misses = d.misses + 1
+    if d.misses > #BRUTE then d.misses = 0 end
+end)
+
+-- ====================== Stats button ======================
+ui.new_button("RAGE", "Other", "GodDess: print stats", function()
+    local tot = TOTAL.hit + TOTAL.rmiss
+    client.color_log(180, 140, 255, string.format(
+        "[GodDess] hits=%d resolver_miss=%d other_miss=%d | resolver accuracy=%.0f%%",
+        TOTAL.hit, TOTAL.rmiss, TOTAL.omiss, tot > 0 and TOTAL.hit / tot * 100 or 0))
+    local keys = {}
+    for k in pairs(STATS) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+        local src, state = k:match("^(.-):(.*)$")
+        local s = STATS[k]
+        local pol, w, acc = eval_src(src, state)
+        client.color_log(180, 140, 255, string.format(
+            "[GodDess] %-14s n=%.1f agree=%.1f acc=%.0f%% polarity=%+d weight=%.2f",
+            k, s.n, s.a, acc * 100, pol, w))
+    end
+end)
+
+-- ====================== Main ======================
+client.set_event_callback("net_update_end", function()
+    if not ui.get(enable) then return end
+    for _, ent in ipairs(entity.get_players(true)) do
+        if entity.is_alive(ent) and not entity.is_dormant(ent) then
+            local d = get_data(ent)
+            update(ent, d)
+            apply(ent, d)
+        end
+    end
+end)
+
+client.set_event_callback("paint", function()
+    if not ui.get(enable) or not ui.get(cb_debug) then return end
+    local best, bd, bs = nil, nil, -1
+    for _, ent in ipairs(entity.get_players(true)) do
+        local d = data[ent]
+        if d and d.has and entity.is_alive(ent) then
+            local s = #d.votes
+            if s > bs then best, bd, bs = ent, d, s end
+        end
+    end
+    if bd then
+        renderer.indicator(180, 140, 255, 255, string.format("GD: %s %s %s%d",
+            bd.src, bd.state, bd.side > 0 and "+" or "-", math.floor(bd.amt)))
+    end
+end)
+
+client.set_event_callback("round_start", function() data = {} end)
+
+client.set_event_callback("player_death", function(e)
+    local ent = client.userid_to_entindex(e.userid)
+    if data[ent] then data[ent] = nil end
+end)
+
+ui.set_callback(enable, function()
+    if not ui.get(enable) then reset_plist() end
+end)
+
+client.set_event_callback("shutdown", function()
+    reset_plist()
+    flush_csv()
+end)
